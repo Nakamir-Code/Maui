@@ -375,12 +375,23 @@ partial class CameraManager
 		}
 
 		videoRecordingStream = stream;
-		videoRecordingFinalizeTcs = new TaskCompletionSource();
+		var videoRecordingStartTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		var recordingFinalizeTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		videoRecordingFinalizeTcs = recordingFinalizeTcs;
 		videoRecordingFileName = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.mov");
+		try
+		{
+			var outputUrl = NSUrl.FromFilename(videoRecordingFileName);
+			videoRecordingDelegate = new AVCaptureMovieFileOutputRecordingDelegate(videoRecordingStartTcs, recordingFinalizeTcs);
+			videoOutput.StartRecordingToOutputFile(outputUrl, videoRecordingDelegate);
+		}
+		catch
+		{
+			CleanupVideoRecordingResources();
+			throw;
+		}
 
-		var outputUrl = NSUrl.FromFilename(videoRecordingFileName);
-		videoRecordingDelegate = new AVCaptureMovieFileOutputRecordingDelegate(videoRecordingFinalizeTcs);
-		videoOutput.StartRecordingToOutputFile(outputUrl, videoRecordingDelegate);
+		await videoRecordingStartTcs.Task.WaitAsync(token);
 	}
 
 	private async partial Task<Stream> PlatformStopVideoRecording(CancellationToken token)
@@ -629,10 +640,18 @@ partial class CameraManager
 	}
 }
 
-class AVCaptureMovieFileOutputRecordingDelegate(TaskCompletionSource taskCompletionSource) : AVCaptureFileOutputRecordingDelegate
+class AVCaptureMovieFileOutputRecordingDelegate(TaskCompletionSource startTcs, TaskCompletionSource finalizeTcs) : AVCaptureFileOutputRecordingDelegate
 {
+	public override void DidStartRecording(AVCaptureFileOutput captureOutput, NSUrl outputFileUrl, NSObject[] connections)
+	{
+		startTcs.TrySetResult();
+	}
+
 	public override void FinishedRecording(AVCaptureFileOutput captureOutput, NSUrl outputFileUrl, NSObject[] connections, NSError? error)
 	{
-		taskCompletionSource.SetResult();
+		startTcs.TrySetException(new CameraException(error is null
+			? "Video recording finished before it started."
+			: $"Video recording failed to start: {error.LocalizedDescription}"));
+		finalizeTcs.TrySetResult();
 	}
 }

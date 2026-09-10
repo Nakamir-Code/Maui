@@ -21,13 +21,25 @@ namespace CommunityToolkit.Maui.Core;
 
 public class CameraConsumer(TaskCompletionSource finalizeTcs) : Object, IConsumer
 {
+	readonly TaskCompletionSource? startTcs;
 	readonly TaskCompletionSource? finalizeTcs = finalizeTcs;
+
+	internal CameraConsumer(TaskCompletionSource startTcs, TaskCompletionSource finalizeTcs) : this(finalizeTcs)
+	{
+		this.startTcs = startTcs;
+	}
 
 	public void Accept(Object? videoRecordEvent)
 	{
-		if (videoRecordEvent is VideoRecordEvent.Finalize)
+		switch (videoRecordEvent)
 		{
-			finalizeTcs?.SetResult();
+			case VideoRecordEvent.Start:
+				startTcs?.TrySetResult();
+				break;
+			case VideoRecordEvent.Finalize finalizeEvent:
+				startTcs?.TrySetException(new CameraException($"Video recording failed to start (CameraX error {finalizeEvent.Error})."));
+				finalizeTcs?.TrySetResult();
+				break;
 		}
 	}
 }
@@ -416,6 +428,11 @@ partial class CameraManager
 
 	private async partial Task PlatformStartVideoRecording(Stream stream, CancellationToken token)
 	{
+		if (videoRecordingFinalizeTcs?.Task.IsCompleted is true)
+		{
+			CleanupVideoRecordingResources();
+		}
+
 		if (previewView is null
 			|| processCameraProvider is null
 			|| cameraPreview is null
@@ -441,17 +458,28 @@ partial class CameraManager
 		}
 
 		videoRecordingFile = new Java.IO.File(context.CacheDir, $"{DateTime.UtcNow.Ticks}.mp4");
-		videoRecordingFile.CreateNewFile();
+		var videoRecordingStartTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		var recordingFinalizeTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		videoRecordingFinalizeTcs = recordingFinalizeTcs;
 
-		var outputOptions = new FileOutputOptions.Builder(videoRecordingFile).Build();
+		try
+		{
+			videoRecordingFile.CreateNewFile();
+			var outputOptions = new FileOutputOptions.Builder(videoRecordingFile).Build();
+			var captureListener = new CameraConsumer(videoRecordingStartTcs, recordingFinalizeTcs);
+			var executor = ContextCompat.GetMainExecutor(context) ?? throw new CameraException($"Unable to retrieve {nameof(IExecutorService)}");
+			videoRecording = videoRecorder
+				.PrepareRecording(context, outputOptions)
+				?.WithAudioEnabled()
+				.Start(executor, captureListener) ?? throw new InvalidOperationException("Unable to prepare recording");
+		}
+		catch (System.Exception)
+		{
+			CleanupVideoRecordingResources();
+			throw;
+		}
 
-		videoRecordingFinalizeTcs = new TaskCompletionSource();
-		var captureListener = new CameraConsumer(videoRecordingFinalizeTcs);
-		var executor = ContextCompat.GetMainExecutor(context) ?? throw new CameraException($"Unable to retrieve {nameof(IExecutorService)}");
-		videoRecording = videoRecorder
-			.PrepareRecording(context, outputOptions)
-			?.WithAudioEnabled()
-			.Start(executor, captureListener) ?? throw new InvalidOperationException("Unable to prepare recording");
+		await videoRecordingStartTcs.Task.WaitAsync(token);
 
 		// `.PrepareRecording()` should never return null
 		// According to the Android docs, `Recorder.prepareRecording(Context, eMediaSoreOutputOptions)` returns a `NonNull` object
